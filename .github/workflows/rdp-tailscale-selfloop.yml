@@ -1,4 +1,4 @@
-name: RDP via Tailscale (A → B, same repo, Win2025 + screenshots + data handoff + Telegram)
+name: RDP via Tailscale (Self-Loop, Win2025 + screenshots + data handoff + Telegram)
 
 on:
   workflow_dispatch:
@@ -20,11 +20,14 @@ on:
         description: "(optional) JSON telegram, e.g. {\"enable\":true,\"bot_token\":\"123:ABC\",\"chat_id\":\"-100...\"}"
         required: false
         default: ""
-      cycles:            { description: "0=infinite; N=remaining handoffs incl. this run", required: false, default: "0" }
+      cycles:
+        description: "0 = infinite; N = remaining runs including this one"
+        required: false
+        default: "0"
 
 permissions:
-  contents: write   # needed for handoff commit if xfer_json targets same repo
-  actions: write
+  contents: write    # for optional handoff commit
+  actions: write     # to self-dispatch
 
 concurrency:
   group: tailscale-rdp-singleton
@@ -43,15 +46,17 @@ jobs:
       RDP_PASS:    Bullet@12345
       TS_HOSTNAME: bullet
       X_DIR:       C:\Users\Public\Transfer
+
     steps:
-      - name: Checkout (for same-repo handoff commits if used)
+      - name: Checkout (needed if you ever want to commit to this repo)
         uses: actions/checkout@v4
 
-      - name: Build & run (A)
-        id: runa
+      - name: Run session
+        id: run
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path "$env:X_DIR" | Out-Null
+
           function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           function Summary($title,[string[]]$lines){ (@("### $title") + $lines + "") -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
@@ -90,14 +95,15 @@ jobs:
           $doPurge   = Yes("${{ inputs.purge_bullet }}")
           $cyclesIn  = IntOr("${{ inputs.cycles }}", 0)
           $cyclesOut = if ($cyclesIn -gt 0) { $cyclesIn - 1 } else { 0 }
+
           "cycles_next=$cyclesOut" | Out-File -Append $env:GITHUB_OUTPUT
 
-          Summary "Inputs (A)" @(
+          Summary "Inputs" @(
             "| Key | Value |","|---|---|",
             "| TestMode | $test |","| Runtime | $runtime |","| CyclesLeft | $cyclesIn |",
             "| Hostname | $env:TS_HOSTNAME |"
           )
-          TgSend ("🟦 *A started* — runtime: $runtime min")
+          TgSend ("🔵 *RDP session starting* — runtime: $runtime min")
 
           # ---------- Install Tailscale ----------
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
@@ -137,7 +143,7 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          # ---------- Login to tailnet ----------
+          # ---------- Tailscale up ----------
           & $ts logout | Out-Null
           & $ts up --authkey "$authKey" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
 
@@ -157,10 +163,10 @@ jobs:
           "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
           "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
 
-          Summary "RDP (A)" @("**User:** $env:RDP_USER","**Pass:** $env:RDP_PASS","**IPv4:** $ip4","**MagicDNS:** $fqdn","**DERP:** $derp")
-          TgSend ("🖥️ A RDP ready — `$fqdn` / `$ip4`")
+          Summary "RDP Details" @("**User:** $env:RDP_USER","**Pass:** $env:RDP_PASS","**IPv4:** $ip4","**MagicDNS:** $fqdn","**DERP:** $derp")
+          TgSend ("🖥️ RDP ready — `$fqdn` / `$ip4`")
 
-          # ---------- Take screenshot (start) ----------
+          # ---------- Screenshot (start) ----------
           $startPng = Join-Path $env:RUNNER_TEMP "rdp-start.png"
           Add-Type -AssemblyName System.Windows.Forms, System.Drawing
           $bmp = New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,[System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
@@ -171,11 +177,11 @@ jobs:
           "start_png=$startPng" | Out-File -Append $env:GITHUB_OUTPUT
 
           # ---------- Keep alive ----------
-          $end=(Get-Date).AddMinutes($runtime); $lastNotice=-1
+          $runtime = [int]"$runtime"
+          $end=(Get-Date).AddMinutes($runtime)
           while((Get-Date) -lt $end){
             $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
             Write-Host "RDP alive... ($left min left)"
-            if($left -ne $lastNotice -and $left % 60 -eq 0){ $lastNotice=$left; TgSend("⏰ A: $left min left") }
             Start-Sleep -Seconds 60
           }
 
@@ -189,9 +195,11 @@ jobs:
           $gfx.Dispose(); $bmp.Dispose()
           "end_png=$endPng" | Out-File -Append $env:GITHUB_OUTPUT
 
-          # ---------- Handoff JSON (write locally) ----------
+          # ---------- Handoff JSON (artifact + optional repo) ----------
           $handoff = @{
-            role      = "A"
+            runId     = "${{ github.run_id }}"
+            repo      = "${{ github.repository }}"
+            ref       = "${{ github.ref_name }}"
             hostname  = "$env:TS_HOSTNAME"
             ipv4      = "$ip4"
             magicdns  = "$fqdn"
@@ -199,27 +207,42 @@ jobs:
             user      = "$env:RDP_USER"
             pass      = "$env:RDP_PASS"
             finished  = (Get-Date).ToString("s")
-            nextFlow  = "B"
+            nextRuns  = $cyclesOut
           } | ConvertTo-Json -Depth 8
-          $handoffPath = Join-Path $env:X_DIR "handoff-A.json"
+          $handoffPath = Join-Path $env:X_DIR "handoff.json"
           $handoff | Out-File $handoffPath -Encoding utf8
           "handoff=$handoffPath" | Out-File -Append $env:GITHUB_OUTPUT
-          TgSend ("🟦 *A finished* — dispatching B")
+
+          # ---------- Optional purge (exit) ----------
+          if ($doPurge) {
+            try {
+              $tn = [uri]::EscapeDataString($tailnet)
+              $hdr = @{ Authorization = "Bearer $apiKey" }
+              $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+              foreach($d in $resp.devices){
+                if($d.name -match '(?i)bullet' -or $d.hostname -match '(?i)bullet' -or $d.DNSName -match '(?i)bullet'){
+                  try{ Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null }catch{}
+                }
+              }
+            } catch { Write-Warning "Exit purge failed: $_" }
+          }
+
+          TgSend ("🔵 *Session finished* — nextRuns: $cyclesOut")
 
       - name: Upload screenshots
         uses: actions/upload-artifact@v4
         with:
-          name: rdp-screenshots-A
+          name: rdp-screenshots
           path: |
-            ${{ steps.runa.outputs.start_png }}
-            ${{ steps.runa.outputs.end_png }}
+            ${{ steps.run.outputs.start_png }}
+            ${{ steps.run.outputs.end_png }}
           if-no-files-found: warn
 
       - name: Upload handoff JSON (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: handoff-A
-          path: ${{ steps.runa.outputs.handoff }}
+          name: handoff
+          path: ${{ steps.run.outputs.handoff }}
           if-no-files-found: error
 
       - name: Commit handoff JSON to xfer repo (optional)
@@ -230,54 +253,37 @@ jobs:
           $x = $env:XFER | ConvertFrom-Json
           $owner = $x.owner; $repo = $x.repo; $tag = if($x.tag){$x.tag}else{"pingpong-handoff"}; $pat = $x.pat
           if(-not $owner -or -not $repo -or -not $pat){ Write-Host "xfer_json missing owner/repo/pat"; exit 0 }
-          $pathRel = "handoff/$tag-A.json"
-          $content = Get-Content "${{ steps.runa.outputs.handoff }}" -Raw
+          $pathRel = "handoff/$tag.json"
+          $content = Get-Content "${{ steps.run.outputs.handoff }}" -Raw
           $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($content))
           $hdr = @{ Authorization = "Bearer $pat"; Accept = "application/vnd.github+json" }
           # Try to read existing sha
           $sha = $null
-          try {
-            $u = "https://api.github.com/repos/$owner/$repo/contents/$pathRel"
-            $r = Invoke-RestMethod -Headers $hdr -Uri $u -Method GET
-            $sha = $r.sha
-          } catch {}
-          $body = @{ message="handoff A -> B"; content=$b64; branch="main" }
+          try { $r = Invoke-RestMethod -Headers $hdr -Uri ("https://api.github.com/repos/$owner/$repo/contents/$pathRel") -Method GET; $sha = $r.sha } catch {}
+          $body = @{ message="handoff update"; content=$b64; branch="main" }
           if($sha){ $body.sha = $sha }
           $json = $body | ConvertTo-Json -Depth 10
-          Invoke-RestMethod -Headers $hdr -Uri "https://api.github.com/repos/$owner/$repo/contents/$pathRel" -Method PUT -Body $json
+          Invoke-RestMethod -Headers $hdr -Uri ("https://api.github.com/repos/$owner/$repo/contents/$pathRel") -Method PUT -Body $json
 
-      - name: PURGE bullet devices (exit)
-        if: always() && inputs.purge_bullet == 'true'
-        run: |
-          try {
-            $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
-            $hdr = @{ Authorization = "Bearer ${{ inputs.ts_api_key }}" }
-            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
-            foreach($d in $resp.devices){
-              if($d.name -match '(?i)bullet' -or $d.hostname -match '(?i)bullet' -or $d.DNSName -match '(?i)bullet'){
-                try{ Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null }catch{}
-              }
-            }
-          } catch { Write-Warning "Exit purge failed: $_" }
-
-      - name: Dispatch B (same repo via GITHUB_TOKEN)
-        if: always()
+      - name: Self-dispatch (loop)
+        if: always() && (inputs.cycles == '0' || steps.run.outputs.cycles_next != '0')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $next = "${{ steps.run.outputs.cycles_next }}"
           $payload = @{
             ts_tailnet      = "${{ inputs.ts_tailnet }}"
             ts_api_key      = "${{ inputs.ts_api_key }}"
             ts_authkey      = "${{ inputs.ts_authkey }}"
-            test_mode       = "false"
+            test_mode       = "false"                          # force full run next time unless you want to keep test
             runtime_minutes = "${{ inputs.runtime_minutes }}"
             purge_bullet    = "${{ inputs.purge_bullet }}"
             xfer_json       = "${{ inputs.xfer_json }}"
             tg_json         = "${{ inputs.tg_json }}"
-            cycles          = "${{ steps.runa.outputs.cycles_next }}"
+            cycles          = "$next"
           }
-          $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
+          $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-selfloop.yml/dispatches"
           $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
           $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 8
           Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
-          Write-Host "Dispatched Workflow B"
+          Write-Host "Self-dispatched next run (cycles=$next)"
