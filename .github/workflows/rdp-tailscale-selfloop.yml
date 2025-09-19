@@ -3,304 +3,93 @@ name: RDP via Tailscale (Self-Loop, Win2025 + screenshots + handoff + Telegram)
 on:
   workflow_dispatch:
     inputs:
-      ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
-      ts_api_key:        { description: "Tailscale API key (device admin, no 'Bearer')", required: true }
-      ts_authkey:        { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
+      ts_tailnet:
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key (device admin, no 'Bearer')"
+        required: true
+      ts_authkey:
+        description: "Tailscale Auth key (reusable or ephemeral)"
+        required: true
       test_mode:
-        description: "Run 5-minute test"
+        description: "Run short 10-minute test (instead of ~6h)"
         type: boolean
         default: false
-      runtime_minutes:   { description: "Runtime (max 360; capped 355)", required: false, default: "355" }
-      purge_bullet:      { description: "Purge 'bullet' devices at start/end (true/false)", required: false, default: "true" }
-      xfer_json:
-        description: "(optional) JSON transfer repo, e.g. {\"owner\":\"you\",\"repo\":\"xfer\",\"pat\":\"ghp_xxx\",\"tag\":\"pingpong\"}"
+      runtime_minutes:
+        description: "Runtime in minutes (max 360; capped to 355)"
         required: false
-        default: ""
-      tg_json:
-        description: "(optional) JSON telegram, e.g. {\"enable\":true,\"bot_token\":\"123:ABC\",\"chat_id\":\"-100...\"}"
-        required: false
-        default: ""
-      cycles:
-        description: "0 = infinite; N = remaining runs including this one"
-        required: false
-        default: "0"
-      fast_restart_gap_seconds:
-        description: "Gap before re-dispatch (seconds)"
-        required: false
-        default: "5"
-
-permissions:
-  contents: write    # for optional handoff commit
-  actions: write     # to self-dispatch
-
-concurrency:
-  group: tailscale-rdp-singleton
-  cancel-in-progress: false
-
-defaults:
-  run:
-    shell: pwsh
+        default: "355"
 
 jobs:
   rdp:
-    runs-on: windows-2025
-    timeout-minutes: 370
-    env:
-      RDP_USER:    Bullettemporary
-      RDP_PASS:    Bullet@12345
-      TS_HOSTNAME: bullet
-      X_DIR:       C:\Users\Public\Transfer
-
+    runs-on: windows-latest
     steps:
-      - name: Checkout (needed if you ever want to commit to this repo)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: RDP session
-        id: run
+      - name: Setup Tailscale
+        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force -Path "$env:X_DIR" | Out-Null
+          Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile ts.msi
+          Start-Process msiexec.exe -Wait -ArgumentList '/i ts.msi /quiet /norestart'
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey "${{ github.event.inputs.ts_authkey }}" --accept-dns=true
 
-          function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
-          function Summary($title,[string[]]$lines){ (@("### $title") + $lines + "") -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
-          function TryInvoke($script, $retries=3, $delay=2){
-            for($i=0;$i -le $retries;$i++){
-              try { & $script; return $true } catch { if($i -eq $retries){ throw } ; Start-Sleep -Seconds $delay }
-            }
-          }
+      - name: RDP session
+        id: rdp
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          # ---------- Parse optional JSON blobs ----------
-          $XRAW = "${{ inputs.xfer_json }}"; $TRAW = "${{ inputs.tg_json }}"
-          $x = if ($XRAW.Trim()) { $XRAW | ConvertFrom-Json } else { $null }
-          $t = if ($TRAW.Trim()) { $TRAW | ConvertFrom-Json } else { $null }
-          $xOwner  = if ($x) { $x.owner }  else { "" }
-          $xRepo   = if ($x) { $x.repo }   else { "" }
-          $xTag    = if ($x -and $x.tag) { $x.tag } else { "pingpong-handoff" }
-          $xPAT    = if ($x) { $x.pat }    else { "" }
-          $tgOn    = if ($t -and $t.enable) { [bool]$t.enable } else { $false }
-          $tgToken = if ($t) { $t.bot_token } else { "" }
-          $tgChat  = if ($t) { $t.chat_id }   else { "" }
-
-          function TgSend([string]$text){
-            if(-not $tgOn){ return }
-            if([string]::IsNullOrWhiteSpace($tgToken) -or [string]::IsNullOrWhiteSpace($tgChat)){ return }
-            try{
-              Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendMessage" `
-                -ContentType "application/x-www-form-urlencoded" `
-                -Body @{chat_id=$tgChat; text=$text; parse_mode="Markdown"} -UseBasicParsing | Out-Null
-            } catch { Write-Warning "Telegram send failed: $_" }
-          }
-
-          # ---------- Inputs / timing ----------
-          $tailnet   = "${{ inputs.ts_tailnet }}"
-          $apiKey    = "${{ inputs.ts_api_key }}"
-          $authKey   = "${{ inputs.ts_authkey }}"
-          $test      = Yes("${{ inputs.test_mode }}")
-          $runtime   = IntOr("${{ inputs.runtime_minutes }}", 355)
-          if ($test) { $runtime = 5 }
-          if (-not $test -and $runtime -lt 6) { $runtime = 355 }
-          if ($runtime -gt 360) { $runtime = 355 }
-          $doPurge   = Yes("${{ inputs.purge_bullet }}")
-          $cyclesIn  = IntOr("${{ inputs.cycles }}", 0)
-          $cyclesOut = if ($cyclesIn -gt 0) { $cyclesIn - 1 } else { 0 }
-          $restartGap = IntOr("${{ inputs.fast_restart_gap_seconds }}", 5)
-
-          "cycles_next=$cyclesOut"  | Out-File -Append $env:GITHUB_OUTPUT
-          "restart_gap=$restartGap" | Out-File -Append $env:GITHUB_OUTPUT
-
-          Summary "Inputs" @(
-            "| Key | Value |","|---|---|",
-            "| TestMode | $test |","| Runtime | $runtime |","| CyclesLeft | $cyclesIn |",
-            "| Hostname | $env:TS_HOSTNAME |","| RestartGap(s) | $restartGap |"
-          )
-          TgSend ("🔵 *RDP session starting* — runtime: $runtime min")
-
-          # ---------- Install Tailscale (if needed) ----------
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          if (-not (Test-Path $ts)) {
-            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
-            $dst = "$env:TEMP\tailscale-setup.exe"
-            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
-            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
-          }
-          Start-Service Tailscale -ErrorAction SilentlyContinue
-
-          # ---------- Optional purge (startup) ----------
-          if ($doPurge) {
-            try {
-              $tn = [uri]::EscapeDataString($tailnet)
-              $hdr = @{ Authorization = "Bearer $apiKey" }
-              $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
-              foreach($d in $resp.devices){
-                if($d.name -match '(?i)bullet' -or $d.hostname -match '(?i)bullet' -or $d.DNSName -match '(?i)bullet'){
-                  try{ Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null }catch{}
-                }
-              }
-            } catch { Write-Warning "Startup purge failed: $_" }
-          }
-
-          # ---------- RDP user & firewall ----------
-          $u=$env:RDP_USER; $p=$env:RDP_PASS
-          $sec = ConvertTo-SecureString $p -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
-            Add-LocalGroupMember -Group Administrators -Member $u
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
-          } else {
-            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
-            Enable-LocalUser -Name $u
-          }
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-
-          # ---------- Tailscale up (with retry + polling) ----------
-          & $ts logout | Out-Null
-          TryInvoke { & $ts up --authkey "$authKey" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false } 2 3 | Out-Null
-
-          # Poll up to ~60s for IPv4 + JSON status
-          $ip4=$null; $status=$null
-          for($i=0;$i -lt 30;$i++){
-            try{ $ip4 = (& $ts ip -4 | Select-Object -First 1) }catch{}
-            try{ $status = & $ts status --json | ConvertFrom-Json }catch{}
-            if($ip4 -and $status -and $status.Self -and $status.Self.DNSName){ break }
-            Start-Sleep -Seconds 2
-          }
-          if(-not $ip4){ throw "❌ tailscale up ok but no IPv4 after waiting." }
-          $fqdn = $status.Self.DNSName
-          $derp = $status.Self.DERP
-
-          "ip4=$ip4"   | Out-File -Append $env:GITHUB_OUTPUT
-          "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
-          "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
-
-          Summary "RDP Details" @("**User:** $env:RDP_USER","**Pass:** $env:RDP_PASS","**IPv4:** $ip4","**MagicDNS:** $fqdn","**DERP:** $derp")
-          TgSend ("🖥️ RDP ready — `$fqdn` / `$ip4`")
-
-          # ---------- Screenshot (start) ----------
+          # Paths
           $startPng = Join-Path $env:RUNNER_TEMP "rdp-start.png"
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          $bmp = New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,[System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
-          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-          $gfx.CopyFromScreen(0,0,0,0,$bmp.Size)
-          $bmp.Save($startPng,[System.Drawing.Imaging.ImageFormat]::Png)
-          $gfx.Dispose(); $bmp.Dispose()
-          "start_png=$startPng" | Out-File -Append $env:GITHUB_OUTPUT
+          $endPng   = Join-Path $env:RUNNER_TEMP "rdp-end.png"
 
-          # ---------- Keep alive ----------
-          $end=(Get-Date).AddMinutes($runtime)
-          while((Get-Date) -lt $end){
-            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
-            Write-Host "RDP alive... ($left min left)"
-            Start-Sleep -Seconds 60
+          # Assemblies
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+
+          function Save-Screen([string]$Path) {
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp    = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+            $gfx    = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $gfx.Dispose()
+            $bmp.Dispose()
           }
 
-          # ---------- Screenshot (end) ----------
-          $endPng = Join-Path $env:RUNNER_TEMP "rdp-end.png"
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          $bmp = New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,[System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
-          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-          $gfx.CopyFromScreen(0,0,0,0,$bmp.Size)
-          $bmp.Save($endPng,[System.Drawing.Imaging.ImageFormat]::Png)
-          $gfx.Dispose(); $bmp.Dispose()
-          "end_png=$endPng" | Out-File -Append $env:GITHUB_OUTPUT
+          # Before session
+          Save-Screen -Path $startPng
 
-          # ---------- Handoff JSON (artifact + optional repo) ----------
-          $handoff = @{
-            runId     = "${{ github.run_id }}"
-            repo      = "${{ github.repository }}"
-            ref       = "${{ github.ref_name }}"
-            hostname  = "$env:TS_HOSTNAME"
-            ipv4      = "$ip4"
-            magicdns  = "$fqdn"
-            derp      = "$derp"
-            user      = "$env:RDP_USER"
-            pass      = "$env:RDP_PASS"
-            finished  = (Get-Date).ToString("s")
-            nextRuns  = $cyclesOut
-          } | ConvertTo-Json -Depth 8
-          $handoffPath = Join-Path $env:X_DIR "handoff.json"
-          $handoff | Out-File $handoffPath -Encoding utf8
-          "handoff=$handoffPath" | Out-File -Append $env:GITHUB_OUTPUT
+          # Runtime (short if test_mode true)
+          $minutes = [int]${{ github.event.inputs.runtime_minutes }}
+          if (${{ github.event.inputs.test_mode }}) { $minutes = 10 }
+          if ($minutes -gt 355) { $minutes = 355 }
+          Write-Host "⏳ Sleeping for $minutes minutes..."
+          Start-Sleep -Seconds ($minutes * 60)
 
-          # ---------- Optional purge (exit) ----------
-          if ($doPurge) {
-            try {
-              $tn = [uri]::EscapeDataString($tailnet)
-              $hdr = @{ Authorization = "Bearer $apiKey" }
-              $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
-              foreach($d in $resp.devices){
-                if($d.name -match '(?i)bullet' -or $d.hostname -match '(?i)bullet' -or $d.DNSName -match '(?i)bullet'){
-                  try{ Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null }catch{}
-                }
-              }
-            } catch { Write-Warning "Exit purge failed: $_" }
-          }
+          # After session
+          Save-Screen -Path $endPng
 
-          TgSend ("🔵 *Session finished* — nextRuns: $cyclesOut")
+          # Outputs
+          "start_png=$startPng" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "end_png=$endPng"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Upload screenshots
         uses: actions/upload-artifact@v4
         with:
-          name: rdp-screenshots
+          name: rdp-screens
           path: |
-            ${{ steps.run.outputs.start_png }}
-            ${{ steps.run.outputs.end_png }}
-          if-no-files-found: warn
+            ${{ steps.rdp.outputs.start_png }}
+            ${{ steps.rdp.outputs.end_png }}
 
       - name: Upload handoff JSON (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: handoff
-          path: ${{ steps.run.outputs.handoff }}
-          if-no-files-found: error
+          name: rdp-handoff
+          path: ${{ runner.temp }}/handoff.json
 
-      - name: Commit handoff JSON to xfer repo (optional)
-        if: ${{ inputs.xfer_json != '' }}
-        env:
-          XFER: ${{ inputs.xfer_json }}
-        run: |
-          $x = $env:XFER | ConvertFrom-Json
-          $owner = $x.owner; $repo = $x.repo; $tag = if($x.tag){$x.tag}else{"pingpong-handoff"}; $pat = $x.pat
-          if(-not $owner -or -not $repo -or -not $pat){ Write-Host "xfer_json missing owner/repo/pat"; exit 0 }
-          $pathRel = "handoff/$tag.json"
-          $content = Get-Content "${{ steps.run.outputs.handoff }}" -Raw
-          $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($content))
-          $hdr = @{ Authorization = "Bearer $pat"; Accept = "application/vnd.github+json" }
-          # Try to read existing sha
-          $sha = $null
-          try { $r = Invoke-RestMethod -Headers $hdr -Uri ("https://api.github.com/repos/$owner/$repo/contents/$pathRel") -Method GET; $sha = $r.sha } catch {}
-          $body = @{ message="handoff update"; content=$b64; branch="main" }
-          if($sha){ $body.sha = $sha }
-          $json = $body | ConvertTo-Json -Depth 10
-          Invoke-RestMethod -Headers $hdr -Uri ("https://api.github.com/repos/$owner/$repo/contents/$pathRel") -Method PUT -Body $json
-
-      - name: Fast gap before self-dispatch
-        if: always()
-        run: |
-          $gap = [int]"${{ steps.run.outputs.restart_gap }}"
-          if($gap -gt 0){ Start-Sleep -Seconds $gap }
-
-      - name: Self-dispatch (loop)
-        if: always() && (inputs.cycles == '0' || steps.run.outputs.cycles_next != '0')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $next = "${{ steps.run.outputs.cycles_next }}"
-          $payload = @{
-            ts_tailnet      = "${{ inputs.ts_tailnet }}"
-            ts_api_key      = "${{ inputs.ts_api_key }}"
-            ts_authkey      = "${{ inputs.ts_authkey }}"
-            test_mode       = "false"                          # force full run unless you want to keep test
-            runtime_minutes = "${{ inputs.runtime_minutes }}"
-            purge_bullet    = "${{ inputs.purge_bullet }}"
-            xfer_json       = "${{ inputs.xfer_json }}"
-            tg_json         = "${{ inputs.tg_json }}"
-            cycles          = "$next"
-            fast_restart_gap_seconds = "${{ inputs.fast_restart_gap_seconds }}"
-          }
-          $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-selfloop.yml/dispatches"
-          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-          $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 8
-          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
-          Write-Host "Self-dispatched next run (cycles=$next)"
+      - name: Complete job
+        run: echo "✅ RDP job complete"
